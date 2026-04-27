@@ -114,7 +114,9 @@ func TestRingBufferDroppedCounter(t *testing.T) {
 
 // TestRingBufferConcurrentPushSnapshot — race-detector probe. With -race,
 // this fails immediately if push/snapshot have an unprotected data race.
+// No assertions: passing under -race IS the assertion.
 func TestRingBufferConcurrentPushSnapshot(t *testing.T) {
+	t.Helper()
 	rb := newRingBuffer(100)
 	var wg sync.WaitGroup
 	wg.Add(2)

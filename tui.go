@@ -185,13 +185,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) scrollUp(n int) {
-	max := m.maxScrollOffset()
-	if max == 0 {
+	maxOffset := m.maxScrollOffset()
+	if maxOffset == 0 {
 		return
 	}
 	m.scrollOffset += n
-	if m.scrollOffset > max {
-		m.scrollOffset = max
+	if m.scrollOffset > maxOffset {
+		m.scrollOffset = maxOffset
 	}
 	m.paused = true
 }

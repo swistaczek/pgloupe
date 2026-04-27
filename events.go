@@ -1,3 +1,7 @@
+// Package main is pgloupe — a TUI for live Postgres wire-protocol
+// inspection. This file holds the shared Event type and the ringbuffer
+// backing the TUI's scrollback. Producers (the proxy) push; consumers
+// (the TUI render loop) snapshot or iterate under an RWMutex.
 package main
 
 import (
@@ -48,27 +52,27 @@ func (e Event) Duration() time.Duration {
 // Goroutine-safe via an internal RWMutex; the proxy goroutine calls push
 // while the TUI goroutine calls snapshot/len/forEach.
 type ringBuffer struct {
-	mu      sync.RWMutex
-	cap     int
-	data    []Event // size up to cap; circular
-	head    int     // index of the NEWEST entry
-	count   int     // number of valid entries (≤ cap)
-	dropped atomic.Uint64
+	mu       sync.RWMutex
+	capacity int
+	data     []Event // size up to capacity; circular
+	head     int     // index of the NEWEST entry
+	count    int     // number of valid entries (≤ capacity)
+	dropped  atomic.Uint64
 }
 
-func newRingBuffer(cap int) *ringBuffer {
-	return &ringBuffer{cap: cap, data: make([]Event, cap)}
+func newRingBuffer(capacity int) *ringBuffer {
+	return &ringBuffer{capacity: capacity, data: make([]Event, capacity)}
 }
 
+// push prepends a new Event. When the buffer is full, the write at the
+// new head position silently overwrites the oldest entry (the slot is
+// reused, no allocation).
 func (r *ringBuffer) push(e Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.head = (r.head - 1 + r.cap) % r.cap
-	if r.count > 0 && r.count == r.cap {
-		// We just overwrote the entry at the new head position.
-	}
+	r.head = (r.head - 1 + r.capacity) % r.capacity
 	r.data[r.head] = e
-	if r.count < r.cap {
+	if r.count < r.capacity {
 		r.count++
 	}
 }
@@ -86,7 +90,7 @@ func (r *ringBuffer) snapshot() []Event {
 	defer r.mu.RUnlock()
 	out := make([]Event, r.count)
 	for i := 0; i < r.count; i++ {
-		out[i] = r.data[(r.head+i)%r.cap]
+		out[i] = r.data[(r.head+i)%r.capacity]
 	}
 	return out
 }
@@ -101,7 +105,7 @@ func (r *ringBuffer) forEach(offset, limit int, fn func(Event) bool) {
 		end = r.count
 	}
 	for i := offset; i < end; i++ {
-		if !fn(r.data[(r.head+i)%r.cap]) {
+		if !fn(r.data[(r.head+i)%r.capacity]) {
 			return
 		}
 	}

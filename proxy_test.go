@@ -122,12 +122,12 @@ func TestRefuseGSSOnStartup(t *testing.T) {
 
 // runForward starts a forward goroutine in the background and returns the
 // pipes the test can use as client + upstream surrogate.
-func runForward(t *testing.T) (clientConn net.Conn, upstreamConn net.Conn, events chan Event, dropped *atomic.Uint64, cancel func()) {
+func runForward(t *testing.T) (clientConn net.Conn, upstreamConn net.Conn, events chan Event, cancel func()) {
 	t.Helper()
 	clientConn, proxyClient := net.Pipe()
 	proxyServer, upstreamConn := net.Pipe()
 	events = make(chan Event, 64)
-	dropped = &atomic.Uint64{}
+	dropped := &atomic.Uint64{}
 	ctx, cancelFn := context.WithCancel(context.Background())
 	go forward(ctx, proxyClient, proxyServer, 1, events, dropped)
 	cancel = func() {
@@ -139,7 +139,7 @@ func runForward(t *testing.T) (clientConn net.Conn, upstreamConn net.Conn, event
 }
 
 func TestForwardSimpleQueryRoundTrip(t *testing.T) {
-	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	clientConn, upstreamConn, events, cancel := runForward(t)
 	defer cancel()
 
 	clientFE := pgproto3.NewFrontend(clientConn, clientConn)
@@ -180,7 +180,7 @@ func TestForwardSimpleQueryRoundTrip(t *testing.T) {
 }
 
 func TestForwardSimpleQueryError(t *testing.T) {
-	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	clientConn, upstreamConn, events, cancel := runForward(t)
 	defer cancel()
 
 	clientFE := pgproto3.NewFrontend(clientConn, clientConn)
@@ -218,7 +218,7 @@ func TestForwardSimpleQueryError(t *testing.T) {
 }
 
 func TestForwardExtendedProtocolPaired(t *testing.T) {
-	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	clientConn, upstreamConn, events, cancel := runForward(t)
 	defer cancel()
 
 	clientFE := pgproto3.NewFrontend(clientConn, clientConn)
@@ -262,7 +262,7 @@ func TestForwardExtendedProtocolPaired(t *testing.T) {
 // TestForwardMultiStatementSimple — C2 fix. Single Query with two statements
 // MUST yield two events (PG sends one CC per statement).
 func TestForwardMultiStatementSimple(t *testing.T) {
-	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	clientConn, upstreamConn, events, cancel := runForward(t)
 	defer cancel()
 
 	clientFE := pgproto3.NewFrontend(clientConn, clientConn)
@@ -299,7 +299,7 @@ func TestForwardMultiStatementSimple(t *testing.T) {
 // TestForwardPipelinedExtended — C2 fix. Two Parse-Bind-Execute sequences
 // before one Sync MUST yield two events (one per Execute).
 func TestForwardPipelinedExtended(t *testing.T) {
-	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	clientConn, upstreamConn, events, cancel := runForward(t)
 	defer cancel()
 
 	clientFE := pgproto3.NewFrontend(clientConn, clientConn)
@@ -347,7 +347,7 @@ func TestForwardPipelinedExtended(t *testing.T) {
 // Bind/Execute messages are skipped by PG until Sync, so their pending
 // entries must be drained as "skipped" events on ReadyForQuery.
 func TestForwardPipelineErrorDrains(t *testing.T) {
-	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	clientConn, upstreamConn, events, cancel := runForward(t)
 	defer cancel()
 
 	clientFE := pgproto3.NewFrontend(clientConn, clientConn)

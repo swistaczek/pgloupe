@@ -97,7 +97,7 @@ func (s *connState) emit(e Event, events chan<- Event) {
 //  2. simple-protocol synthesised event (one per CommandComplete during inSimple)
 //
 // Returns true if an event was emitted.
-func (s *connState) finishOne(tag string, rows int64, errStr string, events chan<- Event) bool {
+func (s *connState) finishOne(tag string, rows int64, errStr string, events chan<- Event) {
 	if len(s.pending) > 0 {
 		e := s.pending[0]
 		s.pending = s.pending[1:]
@@ -106,7 +106,7 @@ func (s *connState) finishOne(tag string, rows int64, errStr string, events chan
 		e.Rows = rows
 		e.Err = errStr
 		s.emit(*e, events)
-		return true
+		return
 	}
 	if s.inSimple {
 		now := time.Now()
@@ -122,9 +122,7 @@ func (s *connState) finishOne(tag string, rows int64, errStr string, events chan
 		}
 		s.simpleStart = now // next CC of the same multi-stmt query starts here
 		s.emit(e, events)
-		return true
 	}
-	return false
 }
 
 func (s *connState) observeFrontend(msg pgproto3.FrontendMessage, _ chan<- Event) {

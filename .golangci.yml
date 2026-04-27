@@ -39,6 +39,13 @@ linters:
         linters: [gosec]
         text: "G204"
 
+      # gosec G104 (errors unhandled) duplicates errcheck on net.Conn.Close
+      # in deferred teardown paths; we already silence those via
+      # errcheck.exclude-functions above.
+      - linters: [gosec]
+        text: "G104"
+        source: "Close\\("
+
       # Tests are noisier on errcheck; we already assert outcomes.
       - path: _test\.go
         linters: [errcheck]
