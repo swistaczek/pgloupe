@@ -13,15 +13,22 @@ linters:
     - unconvert
     - unparam
 
+  settings:
+    errcheck:
+      # Close on net.Conn / net.Listener / *exec.Cmd.Wait during forced
+      # teardown is intentional — the proxy doesn't care if the kernel
+      # already tore down the socket. Same for pgproto3.Send/Flush — errors
+      # are surfaced via the next Receive returning net.ErrClosed.
+      exclude-functions:
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (*github.com/jackc/pgx/v5/pgproto3.Frontend).Send
+        - (*github.com/jackc/pgx/v5/pgproto3.Frontend).Flush
+        - (*github.com/jackc/pgx/v5/pgproto3.Backend).Send
+        - (*github.com/jackc/pgx/v5/pgproto3.Backend).Flush
+
   exclusions:
     rules:
-      # pgproto3 Send/Flush errors are checked downstream via Receive returning
-      # net.ErrClosed; net.Conn.Close errors during forced teardown are
-      # similarly intentional. Tightening either is noisy without value.
-      - path: proxy\.go
-        linters: [errcheck]
-        text: "Error return value of .*(Send|Flush|Close) is not checked"
-
       # G204 (subprocess with variable input) is the explicit design of the
       # --via tunnel: we exec the system `ssh` binary with user-supplied
       # destination + container args. Inputs are validated by
