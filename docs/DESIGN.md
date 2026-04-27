@@ -156,6 +156,8 @@ events channel consumer → goroutine that calls program.Send(eventMsg)
 
 Built on `github.com/charmbracelet/bubbletea/v2` v2.0.6 + `bubbles/v2/key` + `lipgloss/v2`.
 
+**Note on `tea.WithAltScreen()`.** Bubble Tea v2 moved AltScreen control off the `Program` option onto the `View` struct (`v.AltScreen = true` returned from `View()`). pgloupe sets it on every render — Bubble Tea treats this as idempotent. v1 docs that reference `tea.WithAltScreen()` no longer apply.
+
 **Render strategy: custom `View()`, not `viewport`.** Reasons:
 - `viewport.SetContent(string)` re-splits on `\n` every call (`bubbles/viewport/viewport.go:225-227`) — O(N) per event with N=1000 events appended one-by-one ⇒ O(N²) total. Bad for streams.
 - Newest-at-top + autoscroll-with-pause is awkward for `viewport`'s `GotoBottom`/`AtBottom` model.

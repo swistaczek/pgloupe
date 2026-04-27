@@ -1,0 +1,32 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck
+    - unused
+    - unconvert
+    - unparam
+
+  exclusions:
+    rules:
+      # pgproto3 send/flush errors are checked downstream via Receive returning
+      # net.ErrClosed; tightening these is noisy without value.
+      - path: proxy\.go
+        linters: [errcheck]
+        text: "Error return value of .*(Send|Flush) is not checked"
+
+      # SSH stdout from `docker inspect` is intentionally trusted within the
+      # user's own infrastructure; gosec G204 (subprocess with variable input)
+      # is the explicit design.
+      - path: ssh\.go
+        linters: [gosec]
+
+      # Tests are noisier on errcheck; we already assert outcomes.
+      - path: _test\.go
+        linters: [errcheck]
