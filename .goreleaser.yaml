@@ -1,0 +1,97 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: pgloupe
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: pgloupe
+    main: ./
+    binary: pgloupe
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .CommitDate }}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: pgloupe
+    ids:
+      - pgloupe
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE*
+      - README*
+      - CHANGELOG*
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  use: github
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - '^ci:'
+      - 'merge conflict'
+      - '^Merge pull request'
+      - '^Merge branch'
+      - 'go mod tidy'
+
+brews:
+  - name: pgloupe
+    ids:
+      - pgloupe
+    repository:
+      owner: swistaczek
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "brew formula update for {{ .ProjectName }} version {{ .Tag }}"
+    homepage: "https://github.com/swistaczek/pgloupe"
+    description: "Live TUI for inspecting Postgres wire-protocol traffic through a tunnel."
+    license: "MIT"
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/pgloupe --version")
+    install: |
+      bin.install "pgloupe"
+
+release:
+  github:
+    owner: swistaczek
+    name: pgloupe
+  draft: false
+  prerelease: auto
+  name_template: "v{{ .Version }}"
