@@ -46,6 +46,6 @@ linters:
         text: "G104"
         source: "Close\\("
 
-      # Tests are noisier on errcheck; we already assert outcomes.
+      # Tests are noisier on errcheck/gosec; we already assert outcomes.
       - path: _test\.go
-        linters: [errcheck]
+        linters: [errcheck, gosec]
