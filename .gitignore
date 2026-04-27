@@ -1,0 +1,7 @@
+/dist/
+/pgloupe
+*.test
+.DS_Store
+.idea/
+.vscode/
+coverage.out
