@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"net"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,14 +30,12 @@ func TestRefuseSSLOnStartup(t *testing.T) {
 		resultCh <- startup
 	}()
 
-	// Client sends SSLRequest first.
 	frontend := pgproto3.NewFrontend(clientConn, clientConn)
 	frontend.Send(&pgproto3.SSLRequest{})
 	if err := frontend.Flush(); err != nil {
 		t.Fatalf("flush ssl: %v", err)
 	}
 
-	// Expect a single 'N' byte response.
 	buf := make([]byte, 1)
 	if err := clientConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatalf("set deadline: %v", err)
@@ -46,7 +47,6 @@ func TestRefuseSSLOnStartup(t *testing.T) {
 		t.Fatalf("got %q, want 'N'", buf[0])
 	}
 
-	// Now send the real StartupMessage.
 	frontend.Send(&pgproto3.StartupMessage{
 		ProtocolVersion: pgproto3.ProtocolVersionNumber,
 		Parameters:      map[string]string{"user": "alice", "database": "appdb"},
@@ -70,7 +70,6 @@ func TestRefuseSSLOnStartup(t *testing.T) {
 	}
 }
 
-// TestRefuseGSSOnStartup mirrors the SSL refusal flow for GSSEncRequest.
 func TestRefuseGSSOnStartup(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
@@ -121,17 +120,27 @@ func TestRefuseGSSOnStartup(t *testing.T) {
 	}
 }
 
-// TestForwardSimpleQueryRoundTrip drives a full simple-protocol exchange
-// through forward() and asserts: bytes are relayed verbatim in both
-// directions, AND a single paired Event arrives with SQL+Tag+Rows+Duration.
-func TestForwardSimpleQueryRoundTrip(t *testing.T) {
+// runForward starts a forward goroutine in the background and returns the
+// pipes the test can use as client + upstream surrogate.
+func runForward(t *testing.T) (clientConn net.Conn, upstreamConn net.Conn, events chan Event, dropped *atomic.Uint64, cancel func()) {
+	t.Helper()
 	clientConn, proxyClient := net.Pipe()
 	proxyServer, upstreamConn := net.Pipe()
-	defer clientConn.Close()
-	defer upstreamConn.Close()
+	events = make(chan Event, 64)
+	dropped = &atomic.Uint64{}
+	ctx, cancelFn := context.WithCancel(context.Background())
+	go forward(ctx, proxyClient, proxyServer, 1, events, dropped)
+	cancel = func() {
+		cancelFn()
+		clientConn.Close()
+		upstreamConn.Close()
+	}
+	return
+}
 
-	events := make(chan Event, 16)
-	go forward(proxyClient, proxyServer, 1, events)
+func TestForwardSimpleQueryRoundTrip(t *testing.T) {
+	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	defer cancel()
 
 	clientFE := pgproto3.NewFrontend(clientConn, clientConn)
 	clientFE.Send(&pgproto3.Query{String: "SELECT 1"})
@@ -150,45 +159,29 @@ func TestForwardSimpleQueryRoundTrip(t *testing.T) {
 
 	upstreamBE.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
 	upstreamBE.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
-	if err := upstreamBE.Flush(); err != nil {
-		t.Fatalf("upstream flush: %v", err)
-	}
+	upstreamBE.Flush()
 
 	clientReader := pgproto3.NewFrontend(clientConn, clientConn)
 	for i := 0; i < 2; i++ {
-		if _, err := clientReader.Receive(); err != nil {
-			t.Fatalf("client recv %d: %v", i, err)
-		}
+		clientReader.Receive()
 	}
 
 	select {
 	case e := <-events:
-		if e.SQL != "SELECT 1" {
-			t.Fatalf("e.SQL=%q, want SELECT 1", e.SQL)
+		if e.SQL != "SELECT 1" || e.Tag != "SELECT 1" || e.Rows != 1 || e.Status() != StatusOK {
+			t.Fatalf("e=%+v, want SQL/Tag SELECT 1 / Rows 1 / OK", e)
 		}
-		if e.Tag != "SELECT 1" {
-			t.Fatalf("e.Tag=%q, want SELECT 1", e.Tag)
-		}
-		if e.Rows != 1 {
-			t.Fatalf("e.Rows=%d, want 1", e.Rows)
-		}
-		if e.Status() != StatusOK {
-			t.Fatalf("e.Status=%v, want OK", e.Status())
+		if e.Duration() <= 0 {
+			t.Fatal("duration must be positive")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no event")
 	}
 }
 
-// TestForwardSimpleQueryError pairs a Query with an ErrorResponse.
 func TestForwardSimpleQueryError(t *testing.T) {
-	clientConn, proxyClient := net.Pipe()
-	proxyServer, upstreamConn := net.Pipe()
-	defer clientConn.Close()
-	defer upstreamConn.Close()
-
-	events := make(chan Event, 16)
-	go forward(proxyClient, proxyServer, 1, events)
+	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	defer cancel()
 
 	clientFE := pgproto3.NewFrontend(clientConn, clientConn)
 	clientFE.Send(&pgproto3.Query{String: "SELECT * FROM nope"})
@@ -209,30 +202,24 @@ func TestForwardSimpleQueryError(t *testing.T) {
 
 	select {
 	case e := <-events:
-		if e.SQL != "SELECT * FROM nope" {
-			t.Fatalf("e.SQL=%q", e.SQL)
+		if e.SQL != "SELECT * FROM nope" || e.Status() != StatusErr {
+			t.Fatalf("e=%+v, want SQL set + StatusErr", e)
 		}
-		if e.Status() != StatusErr {
-			t.Fatalf("e.Status=%v, want Err", e.Status())
+		if !strings.Contains(e.Err, "42P01") {
+			t.Fatalf("Err missing SQLSTATE: %q", e.Err)
 		}
-		if e.Err == "" {
-			t.Fatal("expected Err string")
+		// I1 fix: should NOT contain duplicate "ERROR:" prefix (Severity is implicit via badge).
+		if strings.Contains(e.Err, "ERROR:") {
+			t.Fatalf("Err includes redundant ERROR: prefix: %q", e.Err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no event")
 	}
 }
 
-// TestForwardExtendedProtocol exercises Parse → Bind → Execute → CommandComplete.
-// Verifies the prepared-statement → portal → SQL recovery chain.
-func TestForwardExtendedProtocol(t *testing.T) {
-	clientConn, proxyClient := net.Pipe()
-	proxyServer, upstreamConn := net.Pipe()
-	defer clientConn.Close()
-	defer upstreamConn.Close()
-
-	events := make(chan Event, 16)
-	go forward(proxyClient, proxyServer, 1, events)
+func TestForwardExtendedProtocolPaired(t *testing.T) {
+	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	defer cancel()
 
 	clientFE := pgproto3.NewFrontend(clientConn, clientConn)
 	clientFE.Send(&pgproto3.Parse{Name: "stmt1", Query: "SELECT $1::int"})
@@ -270,4 +257,145 @@ func TestForwardExtendedProtocol(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no event")
 	}
+}
+
+// TestForwardMultiStatementSimple — C2 fix. Single Query with two statements
+// MUST yield two events (PG sends one CC per statement).
+func TestForwardMultiStatementSimple(t *testing.T) {
+	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	defer cancel()
+
+	clientFE := pgproto3.NewFrontend(clientConn, clientConn)
+	clientFE.Send(&pgproto3.Query{String: "SELECT 1; SELECT 2"})
+	clientFE.Flush()
+
+	upstreamBE := pgproto3.NewBackend(upstreamConn, upstreamConn)
+	upstreamBE.Receive()
+
+	upstreamBE.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+	upstreamBE.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}) // 1 row each
+	upstreamBE.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	upstreamBE.Flush()
+
+	clientReader := pgproto3.NewFrontend(clientConn, clientConn)
+	for i := 0; i < 3; i++ {
+		clientReader.Receive()
+	}
+
+	got := drainEvents(events, 2, 2*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("got %d events, want 2: %+v", len(got), got)
+	}
+	for i, e := range got {
+		if e.SQL != "SELECT 1; SELECT 2" {
+			t.Errorf("got[%d].SQL=%q, want full multi-stmt", i, e.SQL)
+		}
+		if e.Tag != "SELECT 1" {
+			t.Errorf("got[%d].Tag=%q, want SELECT 1", i, e.Tag)
+		}
+	}
+}
+
+// TestForwardPipelinedExtended — C2 fix. Two Parse-Bind-Execute sequences
+// before one Sync MUST yield two events (one per Execute).
+func TestForwardPipelinedExtended(t *testing.T) {
+	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	defer cancel()
+
+	clientFE := pgproto3.NewFrontend(clientConn, clientConn)
+	clientFE.Send(&pgproto3.Parse{Name: "s1", Query: "SELECT 1"})
+	clientFE.Send(&pgproto3.Bind{DestinationPortal: "p1", PreparedStatement: "s1"})
+	clientFE.Send(&pgproto3.Execute{Portal: "p1"})
+	clientFE.Send(&pgproto3.Parse{Name: "s2", Query: "SELECT 2"})
+	clientFE.Send(&pgproto3.Bind{DestinationPortal: "p2", PreparedStatement: "s2"})
+	clientFE.Send(&pgproto3.Execute{Portal: "p2"})
+	clientFE.Send(&pgproto3.Sync{})
+	clientFE.Flush()
+
+	upstreamBE := pgproto3.NewBackend(upstreamConn, upstreamConn)
+	for i := 0; i < 7; i++ {
+		upstreamBE.Receive()
+	}
+
+	upstreamBE.Send(&pgproto3.ParseComplete{})
+	upstreamBE.Send(&pgproto3.BindComplete{})
+	upstreamBE.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+	upstreamBE.Send(&pgproto3.ParseComplete{})
+	upstreamBE.Send(&pgproto3.BindComplete{})
+	upstreamBE.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+	upstreamBE.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	upstreamBE.Flush()
+
+	clientReader := pgproto3.NewFrontend(clientConn, clientConn)
+	for i := 0; i < 7; i++ {
+		clientReader.Receive()
+	}
+
+	got := drainEvents(events, 2, 2*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("got %d events, want 2: %+v", len(got), got)
+	}
+	if got[0].SQL != "SELECT 1" {
+		t.Errorf("got[0].SQL=%q, want SELECT 1", got[0].SQL)
+	}
+	if got[1].SQL != "SELECT 2" {
+		t.Errorf("got[1].SQL=%q, want SELECT 2", got[1].SQL)
+	}
+}
+
+// TestForwardPipelineErrorDrains — mid-pipeline ErrorResponse: subsequent
+// Bind/Execute messages are skipped by PG until Sync, so their pending
+// entries must be drained as "skipped" events on ReadyForQuery.
+func TestForwardPipelineErrorDrains(t *testing.T) {
+	clientConn, upstreamConn, events, _, cancel := runForward(t)
+	defer cancel()
+
+	clientFE := pgproto3.NewFrontend(clientConn, clientConn)
+	clientFE.Send(&pgproto3.Parse{Name: "s1", Query: "SELECT badcol"})
+	clientFE.Send(&pgproto3.Bind{DestinationPortal: "p1", PreparedStatement: "s1"})
+	clientFE.Send(&pgproto3.Execute{Portal: "p1"})
+	clientFE.Send(&pgproto3.Parse{Name: "s2", Query: "SELECT 2"})
+	clientFE.Send(&pgproto3.Bind{DestinationPortal: "p2", PreparedStatement: "s2"})
+	clientFE.Send(&pgproto3.Execute{Portal: "p2"})
+	clientFE.Send(&pgproto3.Sync{})
+	clientFE.Flush()
+
+	upstreamBE := pgproto3.NewBackend(upstreamConn, upstreamConn)
+	for i := 0; i < 7; i++ {
+		upstreamBE.Receive()
+	}
+
+	upstreamBE.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42703", Message: "column \"badcol\" does not exist"})
+	upstreamBE.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	upstreamBE.Flush()
+
+	clientReader := pgproto3.NewFrontend(clientConn, clientConn)
+	clientReader.Receive()
+	clientReader.Receive()
+
+	got := drainEvents(events, 2, 2*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("got %d events, want 2: %+v", len(got), got)
+	}
+	if got[0].Status() != StatusErr {
+		t.Errorf("got[0] status=%v, want Err (the failing query)", got[0].Status())
+	}
+	if got[1].Status() != StatusErr || !strings.Contains(got[1].Err, "skipped") {
+		t.Errorf("got[1] status=%v err=%q, want Err with 'skipped' marker", got[1].Status(), got[1].Err)
+	}
+}
+
+func drainEvents(ch <-chan Event, want int, deadline time.Duration) []Event {
+	out := make([]Event, 0, want)
+	timer := time.NewTimer(deadline)
+	defer timer.Stop()
+	for len(out) < want {
+		select {
+		case e := <-ch:
+			out = append(out, e)
+		case <-timer.C:
+			return out
+		}
+	}
+	return out
 }
