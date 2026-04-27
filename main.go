@@ -21,13 +21,17 @@ var (
 
 func main() {
 	var (
-		listenAddr   = flag.String("listen", "127.0.0.1:25432", "Local TCP address to listen on")
-		upstreamAddr = flag.String("upstream", "127.0.0.1:5432", "Upstream Postgres address to forward to")
-		maxEvents    = flag.Int("max-events", 1000, "Ring buffer size for in-memory events")
-		maxConns     = flag.Int("max-conns", 64, "Maximum concurrent client connections")
-		truncate     = flag.Int("truncate-sql", 80, "Truncate rendered SQL beyond this many chars (0 = full width)")
-		noColor      = flag.Bool("no-color", false, "Disable colored output (also honored: NO_COLOR env)")
-		showVersion  = flag.Bool("version", false, "Print version and exit")
+		listenAddr    = flag.String("listen", "127.0.0.1:25432", "Local TCP address to listen on")
+		upstreamAddr  = flag.String("upstream", "127.0.0.1:5432", "Upstream Postgres address (or, with --via, the remote-side address)")
+		via           = flag.String("via", "", "Open an SSH tunnel through this user@host (uses your ~/.ssh/config)")
+		container     = flag.String("container", "", "With --via: resolve this Docker container's IP on the SSH host (e.g. 'startupkit-db')")
+		dockerNetwork = flag.String("docker-network", "private", "Docker network to inspect with --container")
+		remotePort    = flag.Int("remote-port", 5432, "Remote Postgres port (used by --container)")
+		maxEvents     = flag.Int("max-events", 1000, "Ring buffer size for in-memory events")
+		maxConns      = flag.Int("max-conns", 64, "Maximum concurrent client connections")
+		truncate      = flag.Int("truncate-sql", 80, "Truncate rendered SQL beyond this many chars (0 = full width)")
+		noColor       = flag.Bool("no-color", false, "Disable colored output (also honored: NO_COLOR env)")
+		showVersion   = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `pgloupe — live TUI for inspecting Postgres wire-protocol traffic.
@@ -49,6 +53,12 @@ Examples:
   ssh -fN -L 15432:db-host:5432 you@bastion
   pgloupe --upstream localhost:15432
 
+  # Self-contained: pgloupe opens the SSH tunnel for you
+  pgloupe --via you@bastion --upstream db-host:5432
+
+  # SSH + Docker resolve: pgloupe asks the remote host for the container IP
+  pgloupe --via root@server --container postgres --docker-network bridge
+
 Flags:
 `)
 		flag.PrintDefaults()
@@ -68,8 +78,31 @@ Flags:
 	ctx, cancel := signalContext()
 	defer cancel()
 
+	resolvedUpstream := *upstreamAddr
+	var tunnel *SSHTunnel
+	if *via != "" {
+		t, err := OpenSSHTunnel(ctx, SSHTunnelConfig{
+			Via:           *via,
+			Upstream:      *upstreamAddr,
+			Container:     *container,
+			DockerNetwork: *dockerNetwork,
+			RemotePort:    *remotePort,
+		})
+		if err != nil {
+			log.Fatalf("ssh tunnel: %v", err)
+		}
+		tunnel = t
+		resolvedUpstream = t.LocalAddr
+		fmt.Fprintf(os.Stderr, "pgloupe: ssh tunnel via %s → %s ready at %s\n", *via, *upstreamAddr, t.LocalAddr)
+	}
+	defer func() {
+		if tunnel != nil {
+			_ = tunnel.Close()
+		}
+	}()
+
 	go func() {
-		if err := Serve(ctx, *listenAddr, *upstreamAddr, *maxConns, events, dropped); err != nil {
+		if err := Serve(ctx, *listenAddr, resolvedUpstream, *maxConns, events, dropped); err != nil {
 			log.Printf("proxy: %v", err)
 			cancel()
 		}
