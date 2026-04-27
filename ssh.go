@@ -200,10 +200,16 @@ func resolveContainerIP(ctx context.Context, sshTarget, container, network strin
 	// network is constrained to [A-Za-z0-9_.-] so the Sprintf cannot break
 	// the Go template syntax (no `"`, no `}}`).
 	tmpl := fmt.Sprintf(`{{(index .NetworkSettings.Networks "%s").IPAddress}}`, network)
+	// ssh joins everything after the destination with spaces and runs the
+	// result through the remote login shell. The Go-template `(`, `{`, `}`
+	// would all be parsed by bash if we passed them as separate argv tokens,
+	// so we pre-quote the entire remote command as a single shell-safe string.
+	// container is validated to [A-Za-z0-9_.-] so it cannot contain '.
+	remoteCmd := fmt.Sprintf("docker inspect -f '%s' -- %s", tmpl, container)
 	cmd := exec.CommandContext(ctx, "ssh",
 		"-o", "ConnectTimeout=15",
 		"--", sshTarget,
-		"docker", "inspect", "-f", tmpl, "--", container,
+		remoteCmd,
 	)
 	out, err := cmd.Output()
 	if err != nil {
