@@ -55,10 +55,10 @@ func readStartup(backend *pgproto3.Backend, raw net.Conn) (*pgproto3.StartupMess
 //
 // Two parallel inflight tracks:
 //   - pending []*Event   FIFO of extended-protocol Executes awaiting terminator
-//                        (pipelining: Parse-Bind-Execute, Parse-Bind-Execute, Sync)
+//     (pipelining: Parse-Bind-Execute, Parse-Bind-Execute, Sync)
 //   - simpleSQL          set by Query, used to synthesize one Event per
-//                        CommandComplete in a multi-statement simple query
-//                        ("SELECT 1; SELECT 2;" yields two CCs)
+//     CommandComplete in a multi-statement simple query
+//     ("SELECT 1; SELECT 2;" yields two CCs)
 type connState struct {
 	mu          sync.Mutex
 	id          uint64

@@ -21,32 +21,56 @@ const (
 	smallScreenHeight = 5
 )
 
-// Styles default to dark-terminal-friendly ANSI colors. lipgloss/v2 dropped
+// styles holds the lipgloss styles for one TUI run. Kept on the model
+// (not as package globals) so that --no-color is per-instance and tests
+// don't leak rendering state between runs. lipgloss/v2 dropped
 // AdaptiveColor in favor of a per-render LightDark helper that requires
-// listening to tea.BackgroundColorMsg — too much ceremony for v0.1. Light-
-// terminal users can pass --no-color to fall back to bold/italic only.
-var (
-	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
-	inflightSty = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	okStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	chromeSty   = lipgloss.NewStyle().Foreground(lipgloss.Color("63")).Bold(true)
-	pausedSty   = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
-	dropSty     = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Italic(true)
-)
+// listening to tea.BackgroundColorMsg — too much ceremony for v0.1.
+// Light-terminal users can pass --no-color to fall back to bold/italic.
+type styles struct {
+	err, inflight, ok, chrome, paused, drop lipgloss.Style
+}
+
+func defaultStyles() styles {
+	return styles{
+		// red+bold for ERR — bold remains as a non-color signal for
+		// red-green color blindness (deuteranopia/protanopia).
+		err: lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true),
+		// yellow+italic for inflight — italic is the non-color signal so
+		// the row is distinguishable from OK without depending on hue.
+		inflight: lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Italic(true),
+		ok:       lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
+		chrome:   lipgloss.NewStyle().Foreground(lipgloss.Color("63")).Bold(true),
+		paused:   lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true),
+		drop:     lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Italic(true),
+	}
+}
+
+func plainStyles() styles {
+	return styles{
+		err:      lipgloss.NewStyle().Bold(true),
+		inflight: lipgloss.NewStyle().Italic(true),
+		ok:       lipgloss.NewStyle(),
+		chrome:   lipgloss.NewStyle().Bold(true),
+		paused:   lipgloss.NewStyle().Bold(true),
+		drop:     lipgloss.NewStyle().Italic(true),
+	}
+}
 
 type keyMap struct {
-	Quit, Pause, Up, Down, PageUp, PageDown, Home, Jump, Help key.Binding
+	Quit, Pause, Clear, Up, Down, PageUp, PageDown, Home, Jump, Help key.Binding
 }
 
 func defaultKeys() keyMap {
 	return keyMap{
 		Quit:     key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 		Pause:    key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause")),
+		Clear:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "clear")),
 		Up:       key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
 		Down:     key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
 		PageUp:   key.NewBinding(key.WithKeys("pgup", "ctrl+b"), key.WithHelp("PgUp", "page up")),
 		PageDown: key.NewBinding(key.WithKeys("pgdown", "ctrl+f"), key.WithHelp("PgDn", "page down")),
-		Home:     key.NewBinding(key.WithKeys("home", "G"), key.WithHelp("Home", "oldest")),
+		Home:     key.NewBinding(key.WithKeys("home", "G"), key.WithHelp("Home/G", "oldest")),
 		Jump:     key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "newest")),
 		Help:     key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 	}
@@ -58,7 +82,7 @@ func (k keyMap) ShortHelp() []key.Binding {
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Quit, k.Pause},
+		{k.Quit, k.Pause, k.Clear},
 		{k.Up, k.Down, k.PageUp, k.PageDown},
 		{k.Jump, k.Home, k.Help},
 	}
@@ -70,6 +94,7 @@ type model struct {
 	events       *ringBuffer
 	keys         keyMap
 	help         help.Model
+	styles       styles
 	dropped      *atomic.Uint64 // shared with proxy; nil-safe
 	windowW      int
 	windowH      int
@@ -77,7 +102,7 @@ type model struct {
 	scrollOffset int
 	showHelp     bool
 	noColor      bool
-	truncateW    int
+	truncateW    int // 0 = no truncation (full width)
 }
 
 func newModel(maxEvents int) model {
@@ -86,6 +111,7 @@ func newModel(maxEvents int) model {
 		events:    newRingBuffer(maxEvents),
 		keys:      defaultKeys(),
 		help:      h,
+		styles:    defaultStyles(),
 		truncateW: defaultTruncateW,
 	}
 }
@@ -118,12 +144,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.paused {
 			m.scrollOffset = 0
 		}
+	case tea.MouseWheelMsg:
+		// Mouse wheel scroll. Bubble Tea v2 reports wheel direction via
+		// Button. Up scrolls toward older events (away from newest);
+		// down scrolls back toward newest.
+		switch msg.Button {
+		case tea.MouseWheelUp:
+			m.scrollUp(3)
+		case tea.MouseWheelDown:
+			m.scrollDown(3)
+		}
 	case tea.KeyPressMsg:
 		switch {
 		case key.Matches(msg, m.keys.Quit):
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.Pause):
 			m.paused = !m.paused
+		case key.Matches(msg, m.keys.Clear):
+			m.events.clear()
+			m.scrollOffset = 0
+			m.paused = false
 		case key.Matches(msg, m.keys.Up):
 			m.scrollUp(1)
 		case key.Matches(msg, m.keys.Down):
@@ -170,12 +210,17 @@ func (m *model) scrollDown(n int) {
 func (m model) View() tea.View {
 	v := tea.NewView(m.viewContent())
 	v.AltScreen = true
+	// Enable mouse-wheel scroll. Cell motion is the lighter mode (fires
+	// only on press / release / wheel, not on every cell move) and is
+	// what users expect from `less`/`htop`. We don't react to clicks —
+	// only MouseWheelMsg in Update.
+	v.MouseMode = tea.MouseModeCellMotion
 	return v
 }
 
 func (m model) viewContent() string {
 	if m.windowH > 0 && m.windowH < smallScreenHeight {
-		return chromeSty.Render("pgloupe — terminal too small")
+		return m.styles.chrome.Render("pgloupe — terminal too small")
 	}
 
 	var b strings.Builder
@@ -199,16 +244,16 @@ func (m model) viewContent() string {
 }
 
 func (m model) headerLine() string {
-	parts := []string{chromeSty.Render("pgloupe")}
+	parts := []string{m.styles.chrome.Render("pgloupe")}
 	if m.paused {
-		parts = append(parts, pausedSty.Render("[PAUSED]"))
+		parts = append(parts, m.styles.paused.Render("[PAUSED]"))
 	}
 	if m.dropped != nil {
 		if d := m.dropped.Load(); d > 0 {
-			parts = append(parts, dropSty.Render(fmt.Sprintf("%d dropped", d)))
+			parts = append(parts, m.styles.drop.Render(fmt.Sprintf("%d dropped", d)))
 		}
 	}
-	parts = append(parts, chromeSty.Render(fmt.Sprintf("%d events", m.events.len())))
+	parts = append(parts, m.styles.chrome.Render(fmt.Sprintf("%d events", m.events.len())))
 	return strings.Join(parts, "  ")
 }
 
@@ -216,7 +261,7 @@ func (m model) footerLine() string {
 	if m.showHelp {
 		return m.help.View(m.keys)
 	}
-	return chromeSty.Render(m.help.ShortHelpView(m.keys.ShortHelp()))
+	return m.styles.chrome.Render(m.help.ShortHelpView(m.keys.ShortHelp()))
 }
 
 func (m model) renderRow(e Event) string {
@@ -227,14 +272,14 @@ func (m model) renderRow(e Event) string {
 	}
 	switch e.Status() {
 	case StatusErr:
-		return errStyle.Render(fmt.Sprintf("%s  ERR     %-12s %s",
+		return m.styles.err.Render(fmt.Sprintf("%s  ERR     %-12s %s",
 			ts, "—", truncate(sql, m.truncateW)+"  →  "+e.Err))
 	case StatusInflight:
-		return inflightSty.Render(fmt.Sprintf("%s  …       %-12s %s",
+		return m.styles.inflight.Render(fmt.Sprintf("%s  …       %-12s %s",
 			ts, "—", truncate(sql, m.truncateW)))
 	default:
 		dur := e.Duration().Round(time.Microsecond * 100).String()
-		return okStyle.Render(fmt.Sprintf("%s  %-7s %-12s %s",
+		return m.styles.ok.Render(fmt.Sprintf("%s  %-7s %-12s %s",
 			ts, dur, e.Tag, truncate(sql, m.truncateW)))
 	}
 }
@@ -247,11 +292,15 @@ func normalizeSQL(s string) string {
 
 // truncate clips a string to at most n display runes, appending an ellipsis.
 // Operates on runes (not bytes) so multi-byte UTF-8 isn't sliced mid-codepoint.
+// n <= 0 means "no truncation" (full width); n == 1 returns "…" alone.
 func truncate(s string, n int) string {
+	if n <= 0 {
+		return s
+	}
 	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	if n <= 1 {
+	if n == 1 {
 		return "…"
 	}
 	r := []rune(s)
@@ -279,23 +328,25 @@ func RunTUI(events <-chan Event, maxEvents int, dropped *atomic.Uint64, opts ...
 // ProgramOption tunes the TUI before it starts.
 type ProgramOption func(*model)
 
+// WithNoColor swaps the model's render styles to bold/italic-only
+// equivalents. Per-instance — does not mutate package globals — so a
+// process can host a colored TUI and an uncolored TUI without state
+// crossover, and tests don't leak rendering state across cases.
 func WithNoColor() ProgramOption {
 	return func(m *model) {
 		m.noColor = true
-		// Force lipgloss to no-color profile by reassigning styles to plain.
-		errStyle = lipgloss.NewStyle().Bold(true)
-		inflightSty = lipgloss.NewStyle()
-		okStyle = lipgloss.NewStyle()
-		chromeSty = lipgloss.NewStyle().Bold(true)
-		pausedSty = lipgloss.NewStyle().Bold(true)
-		dropSty = lipgloss.NewStyle().Italic(true)
+		m.styles = plainStyles()
 	}
 }
 
+// WithTruncateWidth sets the SQL truncation column. w <= 0 means
+// "no truncation" — render the full normalized SQL. The flag layer
+// (--truncate-sql 0) relies on this to mean "show everything".
 func WithTruncateWidth(w int) ProgramOption {
 	return func(m *model) {
-		if w > 0 {
-			m.truncateW = w
+		if w < 0 {
+			w = 0
 		}
+		m.truncateW = w
 	}
 }

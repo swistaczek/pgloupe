@@ -6,9 +6,53 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// validSSHTarget matches `[user@]host[:port]` where user/host are made of
+// the characters ssh actually accepts in a destination, and explicitly
+// rejects a leading `-` so a malicious value cannot become an ssh OPTION
+// like `-oProxyCommand=evil`. ssh's argv parser treats any token starting
+// with `-` as a flag, so we anchor on a non-dash first char.
+var validSSHTarget = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.\-@:]*$`)
+
+// validDockerName matches the Docker reference grammar for container
+// names and IDs. Like SSH targets, we forbid a leading `-` so the value
+// cannot be smuggled in as a flag to `docker inspect`.
+var validDockerName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.\-]*$`)
+
+// validateSSHTarget rejects anything that could be parsed by ssh as an
+// option (e.g. `-oProxyCommand=...`) or that contains shell metacharacters.
+// exec.Command does not invoke a shell, but ssh itself walks its own argv
+// for `-o`, `-J`, etc., so we must guard the destination string.
+func validateSSHTarget(s string) error {
+	if s == "" {
+		return errors.New("ssh target is empty")
+	}
+	if strings.HasPrefix(s, "-") {
+		return fmt.Errorf("ssh target %q must not start with '-' (would be parsed as an ssh option)", s)
+	}
+	if !validSSHTarget.MatchString(s) {
+		return fmt.Errorf("ssh target %q has unexpected characters (allowed: letters, digits, _ . - @ :)", s)
+	}
+	return nil
+}
+
+// validateDockerName mirrors validateSSHTarget for container/network names.
+func validateDockerName(label, s string) error {
+	if s == "" {
+		return fmt.Errorf("%s is empty", label)
+	}
+	if strings.HasPrefix(s, "-") {
+		return fmt.Errorf("%s %q must not start with '-' (would be parsed as a docker flag)", label, s)
+	}
+	if !validDockerName.MatchString(s) {
+		return fmt.Errorf("%s %q has unexpected characters (allowed: letters, digits, _ . -)", label, s)
+	}
+	return nil
+}
 
 // SSHTunnel opens a local TCP forward through a remote SSH host.
 //
@@ -44,8 +88,18 @@ type SSHTunnelConfig struct {
 // OpenSSHTunnel sets up the tunnel, blocks until it's ready, and returns
 // a handle the caller must Close() when done.
 func OpenSSHTunnel(ctx context.Context, cfg SSHTunnelConfig) (*SSHTunnel, error) {
-	if cfg.Via == "" {
-		return nil, errors.New("--via is required")
+	if err := validateSSHTarget(cfg.Via); err != nil {
+		return nil, fmt.Errorf("--via: %w", err)
+	}
+	if cfg.Container != "" {
+		if err := validateDockerName("--container", cfg.Container); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.DockerNetwork != "" {
+		if err := validateDockerName("--docker-network", cfg.DockerNetwork); err != nil {
+			return nil, err
+		}
 	}
 	if cfg.RemotePort == 0 {
 		cfg.RemotePort = 5432
@@ -93,9 +147,16 @@ func OpenSSHTunnel(ctx context.Context, cfg SSHTunnelConfig) (*SSHTunnel, error)
 		"-o", "ServerAliveInterval=30",
 		"-o", "ServerAliveCountMax=3",
 		"-L", fmt.Sprintf("%s:%s", localAddr, remoteAddr),
+		// `--` terminates option parsing so cfg.Via cannot be parsed as a
+		// flag even if validateSSHTarget regressed. Defence-in-depth.
+		"--",
 		cfg.Via,
 	}
 	cmd := exec.CommandContext(ctx, "ssh", args...)
+	// Put ssh into its own process group. exec.CommandContext kills only
+	// the leader on ctx cancel; we want the whole tree gone (ssh sometimes
+	// double-forks for ControlMaster/ProxyCommand). Close() targets -PID.
+	setProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start ssh: %w", err)
 	}
@@ -110,12 +171,14 @@ func OpenSSHTunnel(ctx context.Context, cfg SSHTunnelConfig) (*SSHTunnel, error)
 	return &SSHTunnel{cmd: cmd, LocalAddr: localAddr}, nil
 }
 
-// Close terminates the ssh subprocess and waits for it to exit.
+// Close terminates the ssh subprocess and waits for it to exit. Targets
+// the entire process group so any ProxyCommand / ControlMaster children
+// also die instead of leaving an orphaned forwarding tunnel behind.
 func (t *SSHTunnel) Close() error {
 	if t == nil || t.cmd == nil || t.cmd.Process == nil {
 		return nil
 	}
-	_ = t.cmd.Process.Kill()
+	killProcessGroup(t.cmd)
 	return t.cmd.Wait()
 }
 
@@ -123,11 +186,24 @@ func (t *SSHTunnel) Close() error {
 // container's IP on the named Docker network. Format string mirrors the
 // Kit Makefile pattern (`docker inspect -f '{{(index .NetworkSettings.Networks "<net>").IPAddress}}'`).
 func resolveContainerIP(ctx context.Context, sshTarget, container, network string) (string, error) {
+	// Inputs are validated by OpenSSHTunnel before reaching here, but we
+	// re-check defensively in case this becomes a public entry point.
+	if err := validateSSHTarget(sshTarget); err != nil {
+		return "", err
+	}
+	if err := validateDockerName("container", container); err != nil {
+		return "", err
+	}
+	if err := validateDockerName("network", network); err != nil {
+		return "", err
+	}
+	// network is constrained to [A-Za-z0-9_.-] so the Sprintf cannot break
+	// the Go template syntax (no `"`, no `}}`).
 	tmpl := fmt.Sprintf(`{{(index .NetworkSettings.Networks "%s").IPAddress}}`, network)
 	cmd := exec.CommandContext(ctx, "ssh",
 		"-o", "ConnectTimeout=15",
-		sshTarget,
-		"docker", "inspect", "-f", tmpl, container,
+		"--", sshTarget,
+		"docker", "inspect", "-f", tmpl, "--", container,
 	)
 	out, err := cmd.Output()
 	if err != nil {

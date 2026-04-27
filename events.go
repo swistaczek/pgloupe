@@ -107,6 +107,21 @@ func (r *ringBuffer) forEach(offset, limit int, fn func(Event) bool) {
 	}
 }
 
+// clear discards all buffered events. Triggered by the TUI's `c` key.
+// Does NOT reset the dropped-event counter — that's a measurement of
+// proxy backpressure since startup, not "what's currently visible".
+func (r *ringBuffer) clear() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.head = 0
+	r.count = 0
+	// Zero the slice so the GC can reclaim Event.SQL strings (which
+	// can be large). Re-using the underlying array.
+	for i := range r.data {
+		r.data[i] = Event{}
+	}
+}
+
 // noteDropped increments the counter of events lost because the events
 // channel was full. Cheap, lock-free.
 func (r *ringBuffer) noteDropped() { r.dropped.Add(1) }

@@ -1,6 +1,6 @@
-# pgloupe Implementation Plan
+# pgloupe Implementation Plan (archived)
 
-> **For agentic workers:** Use [`superpowers:subagent-driven-development`](../../README.md) (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Historical artifact.** This was the TDD blueprint for the v0.1 build. Some task numbers and file references are now out of date. For the current architecture see [`../DESIGN.md`](../DESIGN.md); for the release workflow see [`../../RELEASING.md`](../../RELEASING.md). Kept here for context.
 
 **Goal:** Ship `pgloupe` v0.1.0 — a TCP proxy that observes Postgres wire-protocol traffic and renders queries (SQL, duration, row count, errors) in a Bubble Tea TUI.
 

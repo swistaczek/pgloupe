@@ -109,25 +109,31 @@ Execute(portal) → CommandComplete | PortalSuspended | EmptyQueryResponse | Err
 Sync → ReadyForQuery
 ```
 
-Per-conn state:
+Per-conn state — two parallel inflight tracks because simple-protocol multi-statement and extended-protocol pipelining cannot share a single slot:
 
 ```go
 type connState struct {
-    preparedSQL  map[string]string  // stmtName → SQL
-    portalToStmt map[string]string  // portalName → stmtName
-    inflight     *Event             // current query event
-    rfqAwaited   int                // count of pending ReadyForQuery
-    txStatus     byte               // 'I'/'T'/'E'
+    mu          sync.Mutex
+    id          uint64
+    pending     []*Event            // FIFO of extended-protocol Executes awaiting terminator
+    simpleSQL   string              // SQL of the in-flight simple Query (multi-stmt may yield N CCs)
+    simpleStart time.Time           // start time for the next CC of a multi-stmt simple query
+    inSimple    bool                // true between Query and ReadyForQuery
+    preparedSQL map[string]string   // Parse.Name → SQL
+    portalStmt  map[string]string   // Bind.DestinationPortal → Bind.PreparedStatement
+    txStatus    byte                // 'I'/'T'/'E'
+    dropped     *atomic.Uint64      // shared with TUI for footer counter
 }
 ```
 
-- `Parse`: store `preparedSQL[m.Name] = m.Query`. Unnamed (`""`) is overwritten by each new Parse — that's fine, it matches Postgres semantics.
-- `Bind`: store `portalToStmt[m.DestinationPortal] = m.PreparedStatement`.
-- `Execute`: look up SQL via portal→stmt→preparedSQL, start the timer, set `inflight`.
-- `CommandComplete` / `EmptyQueryResponse` / `ErrorResponse` / `PortalSuspended`: end the inflight, emit completed `Event`.
-- `ReadyForQuery`: update `txStatus`. Useful as pipeline boundary and tx-state indicator.
+Events are paired into one Event per *logical* query. Two routes converge in `finishOne`:
 
-Pipelining (multiple Parse+Bind+Execute before one Sync) is handled correctly because each Execute has its own terminator. Mid-pipeline ErrorResponse causes Postgres to skip until Sync; Bind/Execute messages between the error and Sync produce no terminator — we mark them `skipped` when we see the next ReadyForQuery.
+- **Extended protocol pipeline.** `Parse` stores SQL by name. `Bind` maps a portal to a prepared-statement name. `Execute` resolves SQL via `portalStmt → preparedSQL` and pushes a fresh `*Event` onto `pending`. The next terminator (`CommandComplete` / `EmptyQueryResponse` / `PortalSuspended` / `ErrorResponse`) pops the head of `pending`, fills in `Finished`/`Tag`/`Rows`/`Err`, and emits.
+- **Simple protocol multi-statement.** `Query{"SELECT 1; SELECT 2"}` causes Postgres to send *two* `CommandComplete`s. We can't pre-populate `pending` because we don't know how many statements until terminators arrive. Instead, on `Query` we set `inSimple = true` and stash `simpleSQL`; each `CommandComplete` while `inSimple` synthesises a fresh `Event` with `simpleSQL`+`simpleStart`, then resets `simpleStart` for the next statement. `ReadyForQuery` clears `inSimple`.
+
+Mid-pipeline error: PG skips messages until `Sync`. `Bind`/`Execute` between the `ErrorResponse` and the next `ReadyForQuery` push entries that never receive a terminator. On `ReadyForQuery` we drain remaining `pending` entries with `Err: "skipped: prior error in pipeline"` so the TUI shows what the server discarded.
+
+The mutex is held during all observation so the two forwarding goroutines (which share the `connState`) can't race on `pending`/`simpleSQL`/`preparedSQL`. The non-blocking `select` in `emit` means the lock is never held across a blocked channel send.
 
 ### CommandTag → row count
 
@@ -145,18 +151,26 @@ From `ErrorResponse` we surface (in priority order): `Severity` (badge), `Code` 
 
 ```
 main goroutine          → tea.Program.Run() (TUI render loop)
-listen goroutine        → Accept loop (one per Listen)
+listen goroutine        → Accept loop in Serve()
 per-connection × 2      → client→server forwarding, server→client forwarding
+                          (synchronised by a sync.WaitGroup; cancel chain
+                          ensures one side closing unblocks the other)
+ctx-watcher (per conn)  → forces both sockets closed on context cancel
 events channel consumer → goroutine that calls program.Send(eventMsg)
+signal handler          → SIGINT/SIGTERM → cancel root ctx → tea.Quit
 ```
 
-`Program.Send` is goroutine-safe (verified at `bubbletea/tea.go:1183-1188`). Per-conn state is owned by the conn's two goroutines via a `sync.Mutex` (or a per-conn dispatcher goroutine if we want lock-free).
+Cancel chain: `signalContext()` cancels the root context on signal. `Serve` exits the Accept loop (the listener was closed by a watcher). Each `forward()` runs a watcher that closes both conns on `<-ctx.Done()`, which makes the two `pgproto3.Receive` calls return `net.ErrClosed`. Both worker goroutines exit, `wg.Wait()` returns, deferred `Close`s fire (idempotent, no error).
+
+`Program.Send` is goroutine-safe (verified at `bubbletea/tea.go:1183-1188`). The pump goroutine drains `events` and calls `Program.Send(eventMsg(...))`. The model holds the ringbuffer pointer; `push` and `forEach` are protected by the buffer's own `RWMutex`, so the pump→model and model→view paths can't race.
+
+Graceful shutdown is preferred over `os.Exit` because Bubble Tea installs raw-mode terminal state and an alt-screen buffer; `os.Exit(0)` skips Bubble Tea's `restoreTerminalState` and leaves the user's shell mangled.
 
 ## TUI
 
 Built on `github.com/charmbracelet/bubbletea/v2` v2.0.6 + `bubbles/v2/key` + `lipgloss/v2`.
 
-**Note on `tea.WithAltScreen()`.** Bubble Tea v2 moved AltScreen control off the `Program` option onto the `View` struct (`v.AltScreen = true` returned from `View()`). pgloupe sets it on every render — Bubble Tea treats this as idempotent. v1 docs that reference `tea.WithAltScreen()` no longer apply.
+**AltScreen + mouse mode are set per-View.** Bubble Tea v2 moved both off the `Program` constructor onto the `View` struct returned from `View()`. pgloupe sets `v.AltScreen = true` and `v.MouseMode = tea.MouseModeCellMotion` on every render; Bubble Tea treats both as idempotent. Don't reach for the v1 `tea.WithAltScreen()` / `tea.WithMouseCellMotion()` Program options — they don't exist in v2.
 
 **Render strategy: custom `View()`, not `viewport`.** Reasons:
 - `viewport.SetContent(string)` re-splits on `\n` every call (`bubbles/viewport/viewport.go:225-227`) — O(N) per event with N=1000 events appended one-by-one ⇒ O(N²) total. Bad for streams.
@@ -186,7 +200,7 @@ type model struct {
 **Row rendering:**
 
 ```
-HH:MM:SS.mmm  3.4ms   SELECT 5    SELECT id, name FROM hiring_applications WHERE…
+HH:MM:SS.mmm  3.4ms   SELECT 5    SELECT id, email FROM users WHERE…
 HH:MM:SS.mmm  ERR     —           SELECT * FROM nonexistent_table  →  42P01: relation does not exist
 HH:MM:SS.mmm  120ms   UPDATE 1    UPDATE users SET last_seen_at = NOW() WHERE id = $1
 HH:MM:SS.mmm  …       —           SELECT pg_sleep(5)                                       (in flight)
@@ -217,14 +231,29 @@ Color via `lipgloss/v2`:
 Single binary, flags only. No config file.
 
 ```
+# Bring-your-own tunnel:
 pgloupe \
   --listen 127.0.0.1:25432   \  # where psql connects
-  --upstream 127.0.0.1:15432 \  # where the SSH tunnel surfaces
+  --upstream 127.0.0.1:5432  \  # where Postgres (or your tunnel) listens
   --max-events 1000          \  # ring buffer size
-  --truncate-sql 200         \  # render SQL up to N chars
+  --max-conns 64             \  # cap concurrent client conns
+  --truncate-sql 80          \  # render SQL up to N chars (0 = full)
+  --no-color                    # also: NO_COLOR env var
+
+# Built-in SSH tunnel (Tier B):
+pgloupe \
+  --via user@bastion         \  # SSH destination (uses ~/.ssh/config)
+  --upstream db-host:5432       # remote address as seen FROM the SSH host
+
+# SSH + Docker container resolution:
+pgloupe \
+  --via root@server          \  # SSH destination
+  --container postgres       \  # container name on the SSH host
+  --docker-network bridge    \  # docker network to inspect (default 'private')
+  --remote-port 5432
 ```
 
-All flags optional with sensible defaults. `pgloupe` with no args = `--listen 127.0.0.1:25432 --upstream 127.0.0.1:15432`.
+All flags optional with sensible defaults. `pgloupe` with no args = `--listen 127.0.0.1:25432 --upstream 127.0.0.1:5432`.
 
 ## Future work (not v1)
 

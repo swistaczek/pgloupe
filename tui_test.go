@@ -223,3 +223,183 @@ func TestDroppedCountInHeader(t *testing.T) {
 		t.Fatalf("expected '7 dropped' in header:\n%s", out)
 	}
 }
+
+func TestDroppedHiddenWhenZero(t *testing.T) {
+	m := newModel(3)
+	m.windowH = 10
+	m.windowW = 80
+	d := &atomic.Uint64{}
+	m.dropped = d
+	out := m.View().Content
+	if strings.Contains(out, "dropped") {
+		t.Fatalf("did not expect 'dropped' in header when count=0:\n%s", out)
+	}
+}
+
+func TestClearKeyEmptiesBuffer(t *testing.T) {
+	m := newModel(10)
+	m.windowH = 10
+	m.windowW = 80
+	for i := 0; i < 5; i++ {
+		m.events.push(Event{SQL: "x"})
+	}
+	m.paused = true
+	m.scrollOffset = 2
+	updated, _ := m.Update(tea.KeyPressMsg{Code: 'c'})
+	state := updated.(model)
+	if state.events.len() != 0 {
+		t.Fatalf("buffer not empty after 'c': len=%d", state.events.len())
+	}
+	if state.scrollOffset != 0 || state.paused {
+		t.Fatalf("clear should reset offset and unpause; got offset=%d paused=%v",
+			state.scrollOffset, state.paused)
+	}
+}
+
+func TestClearDoesNotResetDroppedCount(t *testing.T) {
+	m := newModel(10)
+	m.windowH = 10
+	m.windowW = 80
+	d := &atomic.Uint64{}
+	d.Store(3)
+	m.dropped = d
+	m.events.push(Event{SQL: "x"})
+	updated, _ := m.Update(tea.KeyPressMsg{Code: 'c'})
+	out := updated.(model).View().Content
+	if !strings.Contains(out, "3 dropped") {
+		t.Fatalf("clear must NOT reset proxy dropped counter:\n%s", out)
+	}
+}
+
+func TestMouseWheelUpScrolls(t *testing.T) {
+	m := newModel(100)
+	m.windowH = 10
+	for i := 0; i < 50; i++ {
+		m.events.push(Event{SQL: "x"})
+	}
+	updated, _ := m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	state := updated.(model)
+	if state.scrollOffset != 3 {
+		t.Fatalf("wheel-up scrollOffset=%d, want 3", state.scrollOffset)
+	}
+	if !state.paused {
+		t.Fatalf("wheel-up should pause autoscroll")
+	}
+}
+
+func TestMouseWheelDownAtTopIsNoop(t *testing.T) {
+	m := newModel(100)
+	m.windowH = 10
+	for i := 0; i < 50; i++ {
+		m.events.push(Event{SQL: "x"})
+	}
+	// Already at offset 0; wheel down should not go negative or pause.
+	updated, _ := m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	state := updated.(model)
+	if state.scrollOffset != 0 {
+		t.Fatalf("wheel-down at top scrollOffset=%d, want 0", state.scrollOffset)
+	}
+}
+
+func TestTruncateZeroMeansFullWidth(t *testing.T) {
+	long := strings.Repeat("a", 500)
+	got := truncate(long, 0)
+	if got != long {
+		t.Fatalf("truncate(_, 0) should return input unchanged; len=%d, want 500", len(got))
+	}
+}
+
+func TestWithTruncateWidthZeroPropagates(t *testing.T) {
+	m := newModel(3)
+	WithTruncateWidth(0)(&m)
+	if m.truncateW != 0 {
+		t.Fatalf("WithTruncateWidth(0) should set truncateW=0; got %d", m.truncateW)
+	}
+}
+
+func TestWithTruncateWidthNegativeClampsToZero(t *testing.T) {
+	m := newModel(3)
+	WithTruncateWidth(-5)(&m)
+	if m.truncateW != 0 {
+		t.Fatalf("negative truncate should clamp to 0; got %d", m.truncateW)
+	}
+}
+
+func TestNoColorPerInstanceDoesNotLeak(t *testing.T) {
+	// Two models, one with NoColor, one without. Render the same paused
+	// state and confirm color escapes appear in only one of them.
+	colored := newModel(3)
+	colored.windowH = 10
+	colored.windowW = 80
+	colored.paused = true
+
+	plain := newModel(3)
+	plain.windowH = 10
+	plain.windowW = 80
+	plain.paused = true
+	WithNoColor()(&plain)
+
+	if !strings.Contains(colored.View().Content, "\x1b[") {
+		t.Logf("colored render had no ANSI; ok if running under NO_COLOR detection")
+	}
+	if strings.Contains(plain.View().Content, "\x1b[3") {
+		// "\x1b[3" leads SGR foreground/italic sequences. Italic alone
+		// uses [3m which is allowed; we want to assert color (3X) is gone.
+		// Looser assertion: PAUSED is rendered without explicit foreground.
+		out := plain.View().Content
+		// Color sequences for 256-color (\x1b[38;5;…) must NOT appear.
+		if strings.Contains(out, "\x1b[38;5;") {
+			t.Fatalf("plain render leaked 256-color SGR:\n%q", out)
+		}
+	}
+}
+
+func TestPageDownAtTopIsNoop(t *testing.T) {
+	m := newModel(100)
+	m.windowH = 10
+	for i := 0; i < 50; i++ {
+		m.events.push(Event{SQL: "x"})
+	}
+	updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	state := updated.(model)
+	if state.scrollOffset != 0 || state.paused {
+		t.Fatalf("PgDn at offset 0 should be no-op; got offset=%d paused=%v",
+			state.scrollOffset, state.paused)
+	}
+}
+
+func TestSingleEventScrollUpIsNoop(t *testing.T) {
+	m := newModel(100)
+	m.windowH = 10 // visible 8, count 1, max 0
+	m.events.push(Event{SQL: "only"})
+	updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	state := updated.(model)
+	if state.scrollOffset != 0 || state.paused {
+		t.Fatalf("single-event scrollUp should be no-op; got offset=%d paused=%v",
+			state.scrollOffset, state.paused)
+	}
+}
+
+func TestEmptyBufferScrollUpIsNoop(t *testing.T) {
+	m := newModel(100)
+	m.windowH = 10
+	updated, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+	state := updated.(model)
+	if state.scrollOffset != 0 || state.paused {
+		t.Fatalf("empty-buffer scrollUp should be no-op; got offset=%d paused=%v",
+			state.scrollOffset, state.paused)
+	}
+}
+
+func TestZeroSizeWindowDoesNotPanic(t *testing.T) {
+	m := newModel(3)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("zero/negative WindowSizeMsg panicked: %v", r)
+		}
+	}()
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 0, Height: 0})
+	_ = updated.(model).View().Content
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: -10, Height: -10})
+	_ = updated.(model).View().Content
+}

@@ -15,17 +15,22 @@ linters:
 
   exclusions:
     rules:
-      # pgproto3 send/flush errors are checked downstream via Receive returning
-      # net.ErrClosed; tightening these is noisy without value.
+      # pgproto3 Send/Flush errors are checked downstream via Receive returning
+      # net.ErrClosed; net.Conn.Close errors during forced teardown are
+      # similarly intentional. Tightening either is noisy without value.
       - path: proxy\.go
         linters: [errcheck]
-        text: "Error return value of .*(Send|Flush) is not checked"
+        text: "Error return value of .*(Send|Flush|Close) is not checked"
 
-      # SSH stdout from `docker inspect` is intentionally trusted within the
-      # user's own infrastructure; gosec G204 (subprocess with variable input)
-      # is the explicit design.
+      # G204 (subprocess with variable input) is the explicit design of the
+      # --via tunnel: we exec the system `ssh` binary with user-supplied
+      # destination + container args. Inputs are validated by
+      # validateSSHTarget / validateDockerName which reject anything that
+      # could be parsed as an ssh/docker option (leading `-`, shell
+      # metacharacters). All other gosec rules still apply to ssh.go.
       - path: ssh\.go
         linters: [gosec]
+        text: "G204"
 
       # Tests are noisier on errcheck; we already assert outcomes.
       - path: _test\.go

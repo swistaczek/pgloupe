@@ -43,6 +43,30 @@ checksum:
   name_template: "checksums.txt"
   algorithm: sha256
 
+# Cosign keyless signing of checksums.txt. Verify with:
+#   cosign verify-blob \
+#     --certificate-identity-regexp 'https://github.com/swistaczek/pgloupe/' \
+#     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+#     --certificate checksums.txt.pem \
+#     --signature checksums.txt.sig \
+#     checksums.txt
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    args:
+      - "sign-blob"
+      - "--yes"
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+    artifacts: checksum
+    output: true
+
+# SBOM per archive (CycloneDX-flavoured Syft output).
+sboms:
+  - artifacts: archive
+
 changelog:
   use: github
   sort: asc

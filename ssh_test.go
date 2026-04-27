@@ -59,6 +59,59 @@ func TestWaitForListenerTimesOut(t *testing.T) {
 	}
 }
 
+func TestValidateSSHTargetRejectsOptions(t *testing.T) {
+	bad := []string{
+		"",
+		"-oProxyCommand=evil",
+		"-J jump",
+		"--",
+		"user@host;rm -rf /",
+		"user@host\nrm",
+		"user@host`whoami`",
+		"user@host$(whoami)",
+		"user@ho st",
+	}
+	for _, s := range bad {
+		if err := validateSSHTarget(s); err == nil {
+			t.Errorf("validateSSHTarget(%q) = nil, want error", s)
+		}
+	}
+	good := []string{
+		"host",
+		"user@host",
+		"user@host:2222",
+		"u_ser@host-1.example.com",
+		"root@10.0.0.1",
+	}
+	for _, s := range good {
+		if err := validateSSHTarget(s); err != nil {
+			t.Errorf("validateSSHTarget(%q) = %v, want nil", s, err)
+		}
+	}
+}
+
+func TestValidateDockerNameRejectsOptions(t *testing.T) {
+	bad := []string{
+		"",
+		"-rm",
+		"name with space",
+		`name"injection`,
+		"name}}injection",
+		"name;rm",
+	}
+	for _, s := range bad {
+		if err := validateDockerName("container", s); err == nil {
+			t.Errorf("validateDockerName(%q) = nil, want error", s)
+		}
+	}
+	good := []string{"postgres", "startupkit-db", "pg_17", "pg.1"}
+	for _, s := range good {
+		if err := validateDockerName("container", s); err != nil {
+			t.Errorf("validateDockerName(%q) = %v, want nil", s, err)
+		}
+	}
+}
+
 // itoa avoids strconv import.
 func itoa(i int) string {
 	if i == 0 {
